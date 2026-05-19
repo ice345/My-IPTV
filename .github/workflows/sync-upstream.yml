@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
@@ -54,10 +55,21 @@ jobs:
           fi
           echo "$upstream_branch" > /tmp/upstream_branch
 
-          if ! git merge --no-edit "upstream/$upstream_branch"; then
-            git diff --name-only --diff-filter=U > /tmp/sync_conflicts
-            git merge --abort || true
-            exit 1
+          if ! git merge --no-edit -X theirs "upstream/$upstream_branch"; then
+            git diff --name-only --diff-filter=U > /tmp/sync_conflicts || true
+
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              git checkout --theirs -- "$path" 2>/dev/null || git rm -f -- "$path"
+            done < /tmp/sync_conflicts
+
+            git add -A
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              git merge --abort || true
+              exit 1
+            fi
+
+            git commit --no-edit
           fi
 
           for path in $KEEP_PATHS; do
@@ -80,6 +92,7 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
+            git push origin "HEAD:${GITHUB_REF_NAME}"
             exit 0
           fi
 
@@ -99,7 +112,17 @@ jobs:
           keep_dir="$(cat /tmp/keep_dir)"
 
           git checkout -B "$conflict_branch"
-          git merge --no-edit -X theirs "upstream/$upstream_branch" || true
+          if ! git merge --no-edit -X theirs "upstream/$upstream_branch"; then
+            git diff --name-only --diff-filter=U > /tmp/sync_conflicts || true
+
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              git checkout --theirs -- "$path" 2>/dev/null || git rm -f -- "$path" || true
+            done < /tmp/sync_conflicts
+
+            git add -A
+            git commit --no-edit || true
+          fi
 
           for path in $KEEP_PATHS; do
             rm -rf "$path"
@@ -133,4 +156,4 @@ jobs:
             --base "${GITHUB_REF_NAME}" \
             --head "$conflict_branch" \
             --title "Review upstream sync conflicts" \
-            --body-file SYNC_CONFLICTS.md || true
+            --body-file SYNC_CONFLICTS.md
