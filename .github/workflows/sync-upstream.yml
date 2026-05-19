@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync:
@@ -25,8 +24,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Sync upstream while keeping local paths
-        id: sync
-        continue-on-error: true
         env:
           UPSTREAM_REPO: https://github.com/kakaxi-1/IPTV.git
           KEEP_PATHS: app LOGO pull CNAME egg.xml index.html .github/workflows/sync-upstream.yml scripts/txt_to_m3u.py
@@ -35,8 +32,8 @@ jobs:
 
           worktree="$(pwd)"
           keep_dir="$(mktemp -d)"
+          upstream_dir="$(mktemp -d)"
           mkdir -p "$keep_dir/paths"
-          echo "$keep_dir" > /tmp/keep_dir
 
           for path in $KEEP_PATHS; do
             if [ -e "$path" ]; then
@@ -45,47 +42,34 @@ jobs:
             fi
           done
 
-          git remote remove upstream 2>/dev/null || true
-          git remote add upstream "$UPSTREAM_REPO"
-          git fetch upstream
-
-          upstream_branch="$(git remote show upstream | sed -n 's/.*HEAD branch: //p')"
+          upstream_branch="$(git ls-remote --symref "$UPSTREAM_REPO" HEAD | sed -n 's#^ref: refs/heads/\\(.*\\)[[:space:]]HEAD#\\1#p')"
           if [ -z "$upstream_branch" ]; then
             upstream_branch="main"
           fi
-          echo "$upstream_branch" > /tmp/upstream_branch
 
-          if ! git merge --no-edit -X theirs "upstream/$upstream_branch"; then
-            git diff --name-only --diff-filter=U > /tmp/sync_conflicts || true
+          git clone --depth 1 --branch "$upstream_branch" "$UPSTREAM_REPO" "$upstream_dir/repo"
 
-            while IFS= read -r path; do
-              [ -n "$path" ] || continue
-              git checkout --theirs -- "$path" 2>/dev/null || git rm -f -- "$path"
-            done < /tmp/sync_conflicts
-
-            git add -A
-            if git diff --name-only --diff-filter=U | grep -q .; then
-              git merge --abort || true
-              exit 1
-            fi
-
-            git commit --no-edit
-          fi
-
-          for path in $KEEP_PATHS; do
-            rm -rf "$path"
-          done
+          rsync -a --delete \
+            --exclude ".git/" \
+            --exclude "app/***" \
+            --exclude "LOGO/***" \
+            --exclude "pull/***" \
+            --exclude "CNAME" \
+            --exclude "egg.xml" \
+            --exclude "index.html" \
+            --exclude ".github/workflows/sync-upstream.yml" \
+            --exclude "scripts/txt_to_m3u.py" \
+            "$upstream_dir/repo/" "$worktree/"
 
           cd "$keep_dir/paths"
-          find . -mindepth 1 -maxdepth 1 -exec cp -a {} "$worktree"/ \;
-          cd "$worktree"
+          if [ "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -gt 0 ]; then
+            find . -mindepth 1 -maxdepth 1 -exec cp -a {} "$worktree"/ \;
+          fi
 
       - name: Convert txt playlists to m3u
-        if: steps.sync.outcome == 'success'
         run: python3 scripts/txt_to_m3u.py .
 
       - name: Commit and push changes
-        if: steps.sync.outcome == 'success'
         run: |
           set -euo pipefail
 
@@ -98,62 +82,3 @@ jobs:
 
           git commit -m "Sync upstream and convert playlists"
           git push origin "HEAD:${GITHUB_REF_NAME}"
-
-      - name: Create conflict pull request
-        if: steps.sync.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          KEEP_PATHS: app LOGO pull CNAME egg.xml index.html .github/workflows/sync-upstream.yml scripts/txt_to_m3u.py
-        run: |
-          set -euo pipefail
-
-          upstream_branch="$(cat /tmp/upstream_branch 2>/dev/null || echo main)"
-          conflict_branch="sync-upstream-conflict-${GITHUB_RUN_ID}"
-          keep_dir="$(cat /tmp/keep_dir)"
-
-          git checkout -B "$conflict_branch"
-          if ! git merge --no-edit -X theirs "upstream/$upstream_branch"; then
-            git diff --name-only --diff-filter=U > /tmp/sync_conflicts || true
-
-            while IFS= read -r path; do
-              [ -n "$path" ] || continue
-              git checkout --theirs -- "$path" 2>/dev/null || git rm -f -- "$path" || true
-            done < /tmp/sync_conflicts
-
-            git add -A
-            git commit --no-edit || true
-          fi
-
-          for path in $KEEP_PATHS; do
-            rm -rf "$path"
-          done
-
-          cd "$keep_dir/paths"
-          find . -mindepth 1 -maxdepth 1 -exec cp -a {} "$GITHUB_WORKSPACE"/ \;
-          cd "$GITHUB_WORKSPACE"
-
-          python3 scripts/txt_to_m3u.py .
-
-          {
-            echo "# Upstream sync needs review"
-            echo
-            echo "The automatic merge hit conflicts. This branch was generated with upstream changes preferred for conflicting files, then local protected paths were restored."
-            echo
-            echo "Conflicted files from the first merge attempt:"
-            echo
-            if [ -s /tmp/sync_conflicts ]; then
-              sed 's/^/- /' /tmp/sync_conflicts
-            else
-              echo "- Unknown"
-            fi
-          } > SYNC_CONFLICTS.md
-
-          git add -A
-          git commit -m "Create upstream sync review branch" || true
-          git push --force-with-lease origin "$conflict_branch"
-
-          gh pr create \
-            --base "${GITHUB_REF_NAME}" \
-            --head "$conflict_branch" \
-            --title "Review upstream sync conflicts" \
-            --body-file SYNC_CONFLICTS.md
